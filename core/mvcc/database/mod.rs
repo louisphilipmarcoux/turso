@@ -713,6 +713,10 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
             let Ok(row) = portable_schema_row_from_record(row_version.row.payload()) else {
                 continue;
             };
+            // The rootpage of a schema row is the id of its namespace, not a page.
+            if row.row_type == "schema" {
+                continue;
+            }
             if row.rootpage == rootpage || row.rootpage == alternate_rootpage {
                 return Some(row.name);
             }
@@ -4977,14 +4981,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.checkpoint_dirty_table_keys.clear();
         self.checkpoint_dirty_index_keys.clear();
         let root_pages = schema
-            .tables(NamespaceId::ROOT)
+            .all_tables()
             .filter_map(|table| match table.as_ref() {
                 Table::BTree(btree) => Some(btree.root_page),
                 _ => None,
             })
             .chain(
                 schema
-                    .indexes(NamespaceId::ROOT)
+                    .all_indexes()
                     .filter(|index| index.is_btree_backed())
                     .map(|index| index.root_page),
             )
@@ -5378,7 +5382,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let schema = bootstrap_conn.schema.read();
         let sqlite_schema_root_pages = {
             schema
-                .tables(NamespaceId::ROOT)
+                .all_tables()
                 .filter_map(|t| {
                     if let Table::BTree(btree) = t.as_ref() {
                         Some(btree.root_page)
@@ -5388,7 +5392,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 })
                 .chain(
                     schema
-                        .indexes(NamespaceId::ROOT)
+                        .all_indexes()
                         .filter(|index| index.is_btree_backed())
                         .map(|index| index.root_page),
                 )
@@ -9350,7 +9354,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .and_then(|e| e.value().root_page)
                 .map(|r| r as i64)
         };
-        for (_, table) in schema.tables_mut(NamespaceId::ROOT) {
+        for (_, _, table) in schema.all_tables_mut() {
             let needs = table
                 .btree()
                 .is_some_and(|b| resolve(b.root_page).is_some());
@@ -9365,7 +9369,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
         }
-        for index in schema.indexes_mut(NamespaceId::ROOT) {
+        for index in schema.all_indexes_mut() {
             if let Some(rp) = resolve(index.root_page) {
                 Arc::make_mut(index).root_page = rp;
             }
@@ -9417,7 +9421,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut automatic_indices = HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
+            HashMap::default();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
@@ -9762,7 +9767,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let find_index_info =
             |schema: &Schema, root_page: i64| -> Result<Option<Arc<IndexInfo>>, TryReserveError> {
                 schema
-                    .indexes(NamespaceId::ROOT)
+                    .all_indexes()
                     .find(|idx| idx.root_page == root_page)
                     .map(|idx| {
                         IndexInfo::new_from_index_in(idx.as_ref(), self.alloc.clone()).map(Arc::new)
@@ -9771,9 +9776,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
 
         let schema_has_index_root = |schema: &Schema, root_page: i64| -> bool {
-            schema
-                .indexes(NamespaceId::ROOT)
-                .any(|idx| idx.root_page == root_page)
+            schema.all_indexes().any(|idx| idx.root_page == root_page)
         };
 
         let parsed_op_commit_ts = |op: &ParsedOp| match op {
@@ -10055,7 +10058,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         };
                                         turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                                     }
-                                } else if root_page != 0 {
+                                } else if root_page != 0 && row_type != "schema" {
+                                    // A schema row keeps the namespace id in
+                                    // rootpage; no B-tree has that root.
                                     return Err(LimboError::Corrupt(format!(
                                         "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
                                     )));
@@ -10362,7 +10367,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
+            HashMap::default();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 

@@ -1124,6 +1124,13 @@ impl<'a> Parser<'a> {
             TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("SEQUENCE") => {
                 self.parse_create_sequence()
             }
+            TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("SCHEMA") => {
+                eat_assert!(self, TK_ID);
+                Ok(Stmt::CreateSchema {
+                    name: self.parse_nm()?,
+                    id: None,
+                })
+            }
             _ => Err(Error::ParseError(format!(
                 "unexpected token: {}",
                 first_tok.to_utf8()
@@ -5419,6 +5426,12 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::DropSequence {
                     if_exists,
                     seq_name,
+                })
+            }
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("SCHEMA") => {
+                eat_assert!(self, TK_ID);
+                Ok(Stmt::DropSchema {
+                    name: self.parse_nm()?,
                 })
             }
             _ => Err(Error::ParseError(format!(
@@ -13645,6 +13658,20 @@ mod tests {
                 assert_eq!(seq_name.name.to_string(), "foo");
             }
             _ => panic!("expected DropSequence"),
+        }
+    }
+
+    #[test]
+    fn create_and_drop_schema_take_a_name() {
+        let mut parser = Parser::new(b"CREATE SCHEMA \"app\"");
+        match parser.next_cmd().unwrap().unwrap() {
+            Cmd::Stmt(Stmt::CreateSchema { name, id: None }) => assert_eq!(name.as_str(), "app"),
+            other => panic!("expected CreateSchema, got {other:?}"),
+        }
+        let mut parser = Parser::new(b"DROP SCHEMA app");
+        match parser.next_cmd().unwrap().unwrap() {
+            Cmd::Stmt(Stmt::DropSchema { name }) => assert_eq!(name.as_str(), "app"),
+            other => panic!("expected DropSchema, got {other:?}"),
         }
     }
 

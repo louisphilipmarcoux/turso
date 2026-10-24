@@ -185,6 +185,9 @@ pub struct Resolver<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
+    /// Whether the statement is one the engine runs for itself, such as a
+    /// VACUUM replaying schema rows, which may name reserved objects.
+    nested_statement: bool,
     /// When set, we are compiling the body of a trigger or a (non-materialized)
     /// view for this database. Ordinary triggers and views are restricted to
     /// their own database, but temp-backed triggers follow SQLite's looser
@@ -323,6 +326,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
+            nested_statement: false,
             database_scope: RefCell::new(None),
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -373,6 +377,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
+            nested_statement: self.nested_statement,
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -401,6 +406,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
+            nested_statement: self.nested_statement,
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -754,6 +760,16 @@ impl<'a> Resolver<'a> {
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
+    pub(crate) fn set_nested_statement(&mut self, nested: bool) {
+        self.nested_statement = nested;
+    }
+
+    /// Whether the statement is the engine's own, so a reserved object name
+    /// is allowed in it.
+    pub(crate) fn is_nested_statement(&self) -> bool {
+        self.nested_statement
+    }
+
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => f(self.schema),
@@ -915,6 +931,13 @@ impl<'a> Resolver<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
+                if !self.with_schema(ctx.namespace.database_id, |schema| {
+                    Self::namespace_has_table_like_object(schema, ctx.namespace.id, table_name)
+                }) {
+                    if let Some(root) = self.root_virtual_table(table_name) {
+                        return Some(root);
+                    }
+                }
                 return Some(ctx.namespace);
             }
         }
@@ -923,7 +946,33 @@ impl<'a> Resolver<'a> {
             return Some(namespace);
         }
 
-        self.find_unqualified_existing(table_name, Self::namespace_has_table_like_object)
+        let found =
+            self.find_unqualified_existing(table_name, Self::namespace_has_table_like_object);
+        match found {
+            Some(namespace)
+                if self.with_schema(namespace.database_id, |schema| {
+                    Self::namespace_has_table_like_object(schema, namespace.id, table_name)
+                }) =>
+            {
+                Some(namespace)
+            }
+            other => self.root_virtual_table(table_name).or(other),
+        }
+    }
+
+    /// The root namespace of the main database when it has a virtual table
+    /// called `table_name`. The engine's virtual tables, such as table-valued
+    /// functions and a frontend's catalog tables, exist only there and are
+    /// found from every namespace, the way PostgreSQL's `pg_catalog` is on
+    /// every search path.
+    fn root_virtual_table(&self, table_name: &str) -> Option<NamespaceRef> {
+        self.with_schema(crate::MAIN_DB_ID, |schema| {
+            matches!(
+                schema.get_table(NamespaceId::ROOT, table_name).as_deref(),
+                Some(crate::schema::Table::Virtual(_))
+            )
+        })
+        .then(|| NamespaceRef::root_of(crate::MAIN_DB_ID))
     }
 
     pub(crate) fn resolve_existing_index(
@@ -984,6 +1033,22 @@ impl<'a> Resolver<'a> {
             .name_of_namespace(namespace)
             .expect("the namespace of a sequence has a name");
         format!("{namespace_name}.{seq_name}")
+    }
+
+    /// The name that object `name` of `namespace` is stored under in the
+    /// schema rows and the SQL text of its database.
+    pub(crate) fn stored_name(&self, namespace: NamespaceRef, name: &str) -> String {
+        crate::namespace::stored_name(namespace.id, name)
+    }
+
+    /// The name to write into SQL text for the object `written` of
+    /// `namespace`: the name as written for a root namespace, else the
+    /// stored name.
+    pub(crate) fn name_in_sql(&self, namespace: NamespaceRef, written: &ast::Name) -> ast::Name {
+        if namespace.id.is_root() {
+            return written.clone();
+        }
+        ast::Name::exact(self.stored_name(namespace, written.as_str()))
     }
 
     /// The namespace that the qualifier of `qualified_name` refers to, or
@@ -1063,7 +1128,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// The name of `namespace`: the database's name for a root namespace,
-    /// else the name the namespace was added under.
+    /// else the stored namespace's name.
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.namespaces.name_of(namespace)
     }

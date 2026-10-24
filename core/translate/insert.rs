@@ -696,10 +696,12 @@ pub fn translate_insert(
             // the user-supplied rowid so the next auto-generated rowid is
             // strictly greater. The helper is a no-op when the explicit
             // rowid is already <= current watermark.
-            let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+            let seq_name = crate::schema::autoincrement_sequence_name(
+                &resolver.stored_name(ctx.namespace, &ctx.table.name),
+            );
             let seq = resolver
                 .with_schema(ctx.namespace.database_id, |s| {
-                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                    s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
                 })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
@@ -710,7 +712,7 @@ pub fn translate_insert(
             crate::translate::sequence::emit_disk_advance_past(
                 program,
                 resolver,
-                ctx.namespace,
+                NamespaceRef::root_of(ctx.namespace.database_id),
                 &seq_name,
                 &seq,
                 insertion.key_register(),
@@ -1558,10 +1560,12 @@ fn emit_rowid_generation(
     is_mvcc: bool,
 ) -> Result<()> {
     if ctx.table.has_autoincrement && is_mvcc {
-        let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+        let seq_name = crate::schema::autoincrement_sequence_name(
+            &resolver.stored_name(ctx.namespace, &ctx.table.name),
+        );
         let seq = resolver
             .with_schema(ctx.namespace.database_id, |s| {
-                s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
             })
             .ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
@@ -1572,7 +1576,7 @@ fn emit_rowid_generation(
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
-            ctx.namespace,
+            NamespaceRef::root_of(ctx.namespace.database_id),
             &seq_name,
             &seq,
             insertion.key_register(),
@@ -1771,7 +1775,8 @@ fn open_autoincrement_state(
         db: ctx.namespace.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let table_name_reg =
+        program.emit_string8_new_reg(resolver.stored_name(ctx.namespace, &ctx.table.name));
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -3981,7 +3986,8 @@ pub fn emit_fk_child_insert_checks(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, &child_tbl.name, None)
     })? {
-        let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
+        let is_self_ref = fk_ref.fk.parent_namespace == namespace.id
+            && fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
@@ -3999,7 +4005,7 @@ pub fn emit_fk_child_insert_checks(
         }
         let parent_tbl = resolver
             .with_schema(database_id, |s| {
-                s.get_btree_table(namespace.id, &fk_ref.fk.parent_table)
+                s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
             })
             .expect("parent btree");
         if fk_ref.parent_uses_rowid {
@@ -4294,10 +4300,11 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     for pref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(namespace.id, &parent_table.name)
     })? {
-        let is_self_ref = pref
-            .child_table
-            .name
-            .eq_ignore_ascii_case(&parent_table.name);
+        let is_self_ref = pref.child_namespace == namespace.id
+            && pref
+                .child_table
+                .name
+                .eq_ignore_ascii_case(&parent_table.name);
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
         if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
@@ -4319,7 +4326,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let child_tbl = &pref.child_table;
         let child_cols = &pref.fk.child_columns;
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(namespace.id, &child_tbl.name)
+            s.get_indices(pref.child_namespace, &child_tbl.name)
                 .cloned()
                 .collect()
         });

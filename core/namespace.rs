@@ -7,6 +7,18 @@
 //! names for a root, like `public` for main. A name without a namespace is
 //! looked up through the connection's search path, an ordered list of
 //! namespace names.
+//!
+//! A database can also store more namespaces, like PostgreSQL schemas. A
+//! stored namespace has an id, and the schema of its database keeps its
+//! objects apart from the objects of the other namespaces by that id. On
+//! disk, an object of a stored namespace is stored under a name that starts
+//! with `__turso_ns<id>_`, and the namespace exists while its row of type
+//! `schema` in `sqlite_schema` exists, so creating and dropping one is DDL
+//! of its database: it is part of the transaction, other
+//! connections see it when the schema changes, and the schema has the
+//! namespaces whenever it is loaded. Only the schema loader and the code
+//! that writes schema rows use the stored names; every lookup uses the
+//! namespace id and the name of the object.
 
 use crate::sync::RwLock;
 use crate::{turso_assert, MAIN_DB_ID, TEMP_DB_ID};
@@ -51,6 +63,52 @@ impl NamespaceRef {
     }
 }
 
+/// What the stored names of the objects of a stored namespace start with,
+/// before the namespace's id and an underscore.
+pub const STORED_NAMESPACE_PREFIX: &str = "__turso_ns";
+
+/// The name that object `name` of namespace `namespace` is stored under in
+/// the schema rows of its database.
+pub fn stored_name(namespace: NamespaceId, name: &str) -> String {
+    if namespace.is_root() {
+        return name.to_string();
+    }
+    format!("{STORED_NAMESPACE_PREFIX}{}_{name}", namespace.as_u32())
+}
+
+/// The namespace and name of the object stored under `stored`: the root
+/// namespace and the whole name when the name has no namespace id in front.
+///
+/// `stores_namespaces` says whether the database stores namespaces at all.
+/// When it does not, a name that looks like a stored name is an ordinary
+/// name of the root namespace: SQLite allows such names, and a database
+/// made by SQLite may hold them.
+pub fn parse_stored_name(stores_namespaces: bool, stored: &str) -> (NamespaceId, &str) {
+    if !stores_namespaces {
+        return (NamespaceId::ROOT, stored);
+    }
+    let Some(rest) = stored.strip_prefix(STORED_NAMESPACE_PREFIX) else {
+        return (NamespaceId::ROOT, stored);
+    };
+    let Some((id, name)) = rest.split_once('_') else {
+        return (NamespaceId::ROOT, stored);
+    };
+    match id.parse::<u32>() {
+        Ok(id) if id != 0 => (NamespaceId::new(id), name),
+        _ => (NamespaceId::ROOT, stored),
+    }
+}
+
+/// Whether the engine stores an object under `name` for its own use or, in
+/// a database that stores namespaces, for a stored namespace, so that a
+/// user may not name an object so.
+pub fn is_reserved_object_name(stores_namespaces: bool, name: &str) -> bool {
+    crate::schema::RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || (stores_namespaces && name.starts_with(STORED_NAMESPACE_PREFIX))
+}
+
 /// A name that qualifies object names in SQL and the namespace it refers
 /// to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,14 +127,30 @@ impl Namespace {
         }
     }
 
+    /// The name of the namespace stored in the main database under `id`.
+    pub fn stored(name: &str, id: NamespaceId) -> Self {
+        Self {
+            name: name.to_string(),
+            target: NamespaceRef {
+                database_id: MAIN_DB_ID,
+                id,
+            },
+        }
+    }
+
     pub fn database_id(&self) -> usize {
         self.target.database_id
     }
 
-    /// Whether the namespace is one of the namespaces of its database rather
-    /// than the whole database.
+    /// Whether the namespace is stored in its database rather than being
+    /// the whole database.
     pub fn is_stored(&self) -> bool {
         !self.target.id.is_root()
+    }
+
+    /// The name that object `name` of this namespace is stored under.
+    pub fn stored_name(&self, name: &str) -> String {
+        stored_name(self.target.id, name)
     }
 }
 
@@ -87,6 +161,23 @@ pub struct Namespaces {
 }
 
 impl Namespaces {
+    /// These namespaces together with the stored namespaces `stored` of the
+    /// main database, which a namespace of the same name added here hides.
+    pub fn with_stored<'a>(
+        &self,
+        stored: impl IntoIterator<Item = (NamespaceId, &'a str)>,
+    ) -> Namespaces {
+        let mut name_to_namespace = self.name_to_namespace.read().clone();
+        for (id, name) in stored {
+            name_to_namespace
+                .entry(name.to_string())
+                .or_insert_with(|| Namespace::stored(name, id));
+        }
+        Namespaces {
+            name_to_namespace: RwLock::new(name_to_namespace),
+        }
+    }
+
     /// The namespace called `name`. `name` is normalized.
     pub fn get(&self, name: &str) -> Option<Namespace> {
         match name {
@@ -117,7 +208,7 @@ impl Namespaces {
     }
 
     /// The name of namespace `target`: the database's own name for a root,
-    /// else the first name added for the namespace.
+    /// else the first name added for the stored namespace.
     pub fn name_of(&self, target: NamespaceRef) -> Option<String> {
         if target.id.is_root() {
             return self
@@ -213,7 +304,10 @@ impl Namespaces {
 
 #[cfg(test)]
 mod tests {
-    use super::{Namespace, NamespaceId, NamespaceRef, Namespaces};
+    use super::{
+        is_reserved_object_name, parse_stored_name, stored_name, Namespace, NamespaceId,
+        NamespaceRef, Namespaces,
+    };
     use crate::{MAIN_DB_ID, TEMP_DB_ID};
 
     #[test]
@@ -335,6 +429,97 @@ mod tests {
         assert_eq!(names_of(&order), vec!["app_in_main", "public"]);
         assert_eq!(order[0].target.id, NamespaceId::new(17));
         assert_eq!(order[1].target, NamespaceRef::root_of(MAIN_DB_ID));
+    }
+
+    #[test]
+    fn a_stored_namespace_is_its_own_entry_of_the_search_order() {
+        let namespaces = namespaces_with_app_and_other();
+        namespaces.add(Namespace::database("public", MAIN_DB_ID));
+        let all = namespaces.with_stored([(NamespaceId::new(17), "app_in_main")]);
+        let app = all.get("app_in_main").unwrap();
+        assert_eq!(app.database_id(), MAIN_DB_ID);
+        assert!(app.is_stored());
+        assert_eq!(app.stored_name("t"), "__turso_ns17_t");
+        assert_eq!(all.get("app").unwrap().stored_name("t"), "t");
+        assert_eq!(all.name_of(app.target).as_deref(), Some("app_in_main"));
+        assert_eq!(
+            all.name_of(NamespaceRef::root_of(MAIN_DB_ID)).as_deref(),
+            Some("main")
+        );
+        assert_eq!(names_of(&all.attached_databases()), vec!["app", "other"]);
+        let search_path = names(&["app_in_main", "public", "main", "app_in_main"]);
+        let order = all.search_order(Some(&search_path));
+        assert_eq!(names_of(&order), vec!["app_in_main", "public"]);
+        assert_eq!(order[0].target.id, NamespaceId::new(17));
+        assert_eq!(order[1].target, NamespaceRef::root_of(MAIN_DB_ID));
+    }
+
+    #[test]
+    fn stored_namespaces_are_hidden_by_added_ones_of_the_same_name() {
+        let namespaces = namespaces_with_app_and_other();
+        let all =
+            namespaces.with_stored([(NamespaceId::new(1), "app"), (NamespaceId::new(2), "shop")]);
+        assert_eq!(all.get("app").unwrap().database_id(), 2);
+        assert_eq!(
+            all.get("shop").unwrap(),
+            Namespace::stored("shop", NamespaceId::new(2))
+        );
+        assert_eq!(names_of(&all.others()), vec!["shop", "app", "other"]);
+        assert_eq!(names_of(&namespaces.others()), vec!["app", "other"]);
+    }
+
+    #[test]
+    fn a_stored_name_says_which_namespace_the_object_is_in() {
+        assert_eq!(stored_name(NamespaceId::ROOT, "t"), "t");
+        assert_eq!(stored_name(NamespaceId::new(17), "t"), "__turso_ns17_t");
+        assert_eq!(
+            stored_name(NamespaceId::new(1), "sub.t"),
+            "__turso_ns1_sub.t"
+        );
+        assert_eq!(parse_stored_name(true, "t"), (NamespaceId::ROOT, "t"));
+        assert_eq!(
+            parse_stored_name(false, "__turso_ns17_t"),
+            (NamespaceId::ROOT, "__turso_ns17_t")
+        );
+        assert_eq!(
+            parse_stored_name(true, "__turso_ns17_t"),
+            (NamespaceId::new(17), "t")
+        );
+        assert_eq!(
+            parse_stored_name(true, "__turso_ns1_sub.t"),
+            (NamespaceId::new(1), "sub.t")
+        );
+        assert_eq!(
+            parse_stored_name(true, "__turso_ns17"),
+            (NamespaceId::ROOT, "__turso_ns17")
+        );
+        assert_eq!(
+            parse_stored_name(true, "__turso_nsx_t"),
+            (NamespaceId::ROOT, "__turso_nsx_t")
+        );
+        assert_eq!(
+            parse_stored_name(true, "__turso_ns0_t"),
+            (NamespaceId::ROOT, "__turso_ns0_t")
+        );
+    }
+
+    #[test]
+    fn the_names_of_stored_namespace_objects_are_reserved() {
+        assert!(is_reserved_object_name(true, "__turso_ns17_t"));
+        assert!(is_reserved_object_name(true, "__turso_nst"));
+        assert!(is_reserved_object_name(
+            true,
+            "__turso_internal_namespace_17_app"
+        ));
+        assert!(is_reserved_object_name(true, "sqlite_t"));
+        assert!(!is_reserved_object_name(true, "__turso_t"));
+        assert!(!is_reserved_object_name(true, "t"));
+        assert!(!is_reserved_object_name(false, "__turso_ns17_t"));
+        assert!(is_reserved_object_name(
+            false,
+            "__turso_internal_namespace_17_app"
+        ));
+        assert!(is_reserved_object_name(false, "sqlite_t"));
     }
 
     #[test]

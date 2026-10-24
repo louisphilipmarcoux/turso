@@ -2,7 +2,6 @@ use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput, NodeOutputContra
 use super::stream::{base_arrangement, open_ephemeral_delta, DeltaIdentity, EphemeralDelta};
 use super::MaintenanceInput;
 use crate::incremental::dag;
-use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::Arc;
 use crate::turso_assert;
@@ -22,7 +21,7 @@ pub(super) fn scan_node_output(
         )));
     };
     let stored_weight_column = schema
-        .is_materialized_view(NamespaceId::ROOT, &table.name)
+        .is_materialized_view_root(table.root_page)
         .then(|| table.columns().len());
     EmittedNodeOutput::new(
         node_id,

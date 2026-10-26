@@ -6176,6 +6176,36 @@ pub struct PgShowStmt {
     pub name: String,
 }
 
+/// The statements PostgreSQL still accepts inside an aborted transaction
+/// block: COMMIT/END, ROLLBACK/ABORT, and ROLLBACK TO SAVEPOINT
+/// (`IsTransactionExitStmt` in PostgreSQL's postgres.c). PostgreSQL's list
+/// also has PREPARE TRANSACTION; it is left out here deliberately while
+/// two-phase commit is unsupported.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TxExitStmt {
+    Commit,
+    Rollback,
+    RollbackToSavepoint,
+}
+
+/// Classify a parsed statement as one that ends an aborted transaction
+/// block, or None for every other statement.
+pub fn tx_exit_stmt(parse_result: &ParseResult) -> Option<TxExitStmt> {
+    use pg_query::protobuf::TransactionStmtKind;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::TransactionStmt(txn) = &nodes.first()?.0 else {
+        return None;
+    };
+    match TransactionStmtKind::try_from(txn.kind) {
+        Ok(TransactionStmtKind::TransStmtCommit) => Some(TxExitStmt::Commit),
+        Ok(TransactionStmtKind::TransStmtRollback) => Some(TxExitStmt::Rollback),
+        Ok(TransactionStmtKind::TransStmtRollbackTo) => Some(TxExitStmt::RollbackToSavepoint),
+        _ => None,
+    }
+}
+
 /// Try to extract a SET statement from a PG parse result.
 /// Returns None if the statement is not a SET.
 pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {

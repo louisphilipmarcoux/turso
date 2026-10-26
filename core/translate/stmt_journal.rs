@@ -134,6 +134,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     statement_conflict: ResolveType,
     inserting_multiple_rows: bool,
     has_triggers: bool,
+    has_returning: bool,
     has_fks: bool,
     has_upsert: bool,
     has_upsert_do_update: bool,
@@ -168,7 +169,12 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // UNIQUE constraint (and any other constraints touched by SET), so it
     // can always fail mid-statement and must be undoable via a statement
     // journal — even when e.g. INSERT OR REPLACE alone would never abort.
+    // RETURNING evaluates its expressions after the row is written, so an
+    // expression error strikes mid-statement; the statement needs a savepoint
+    // to undo the row. SQLite gets the same effect because it implements
+    // RETURNING as an internal trigger.
     let may_abort = has_triggers
+        || has_returning
         || has_fks
         || autoinc_may_abort_multi_row
         || has_upsert_do_update
@@ -186,6 +192,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // AUTOINCREMENT is multi-write because sqlite_sequence is updated before constraint checks.
     if !inserting_multiple_rows
         && !has_triggers
+        && !has_returning
         && !any_replace
         && !has_upsert
         && !has_autoincrement
@@ -240,8 +247,9 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
+    let has_returning = plan.returning.as_ref().is_some_and(|r| !r.is_empty());
     let is_single_row = target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !any_replace && !has_fks {
+    if is_single_row && !has_triggers && !has_returning && !any_replace && !has_fks {
         program.set_multi_write(false);
     }
 
@@ -264,7 +272,9 @@ pub(crate) fn set_update_stmt_journal_flags(
         || !btree_table.unique_sets.is_empty()
         || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
+    // RETURNING evaluates after the row write; see set_insert_stmt_journal_flags.
     let may_abort = has_triggers
+        || has_returning
         || has_fks
         || constraint_may_abort(
             has_statement_conflict,
@@ -300,14 +310,16 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
+    let has_returning = !plan.result_columns.is_empty();
     let is_single_row = target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !has_fks {
+    if is_single_row && !has_triggers && !has_returning && !has_fks {
         program.set_multi_write(false);
     }
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
-    // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    // only triggers (RAISE(ABORT)), FK violations, or a RETURNING expression
+    // (evaluated after the row is deleted) can abort.
+    if !has_triggers && !has_returning && !has_fks {
         program.set_may_abort(false);
     }
     Ok(())

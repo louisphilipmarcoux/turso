@@ -1178,6 +1178,10 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// The main pager's `pages_dirtied_count` when this statement became an
+    /// active write; abort() compares it to tell whether the statement
+    /// dirtied pages. None when the writer targets another database.
+    pub(crate) pages_dirtied_at_write_start: Option<u64>,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -1279,6 +1283,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            pages_dirtied_at_write_start: None,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -1451,6 +1456,7 @@ impl ProgramState {
         }
         self.uses_subjournal = false;
         self.is_active_write = false;
+        self.pages_dirtied_at_write_start = None;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
@@ -3474,6 +3480,30 @@ impl Program {
             }
         }
 
+        /// Whether this error can be raised after the statement already
+        /// modified pages. Ordinary runtime errors (overflow, type errors,
+        /// constraint checks, ...) are raised before a statement without a
+        /// statement savepoint writes anything, so the transaction survives
+        /// them. The errors below can strike mid-write, and partial writes
+        /// with no statement savepoint to undo them force a rollback of the
+        /// whole transaction. SQLite applies the same rule to its "special
+        /// errors" (sqlite3VdbeHalt), except that SQLite also drops the
+        /// transaction on any I/O error or interrupted writer even with a
+        /// statement journal — it cannot tell whether the failure hit a cache
+        /// spill of earlier pages, while our statement savepoint replay
+        /// reports its own failure if it cannot restore the pre-statement
+        /// state.
+        fn error_can_strike_mid_write(err: &LimboError) -> bool {
+            matches!(
+                err,
+                LimboError::CompletionError(_)
+                    | LimboError::DatabaseFull
+                    | LimboError::CacheError(_)
+                    | LimboError::Corrupt(_)
+                    | LimboError::Interrupt
+            )
+        }
+
         let mut abort_error: Option<LimboError> = None;
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
@@ -3862,9 +3892,40 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
-                        {
+                        // An ordinary error, or a clean drop (err == None),
+                        // keeps the transaction: ordinary errors fail before
+                        // writing, and a dropped unfinished writer was poisoned
+                        // above so the caller must ROLLBACK explicitly.
+                        let mid_write_error =
+                            unfinished_writer && err.is_some_and(error_can_strike_mid_write);
+                        // Ordinary errors must be raised before a statement
+                        // without a statement savepoint writes anything. A
+                        // violation means a statement shape is missing from the
+                        // savepoint analysis in translate/stmt_journal.rs or an
+                        // error is missing from error_can_strike_mid_write:
+                        // fail loudly in debug builds, and roll the transaction
+                        // back rather than keep its partial writes. SQLite
+                        // asserts the same invariant
+                        // (sqlite3VdbeAssertAbortable).
+                        let wrote_without_savepoint = !can_autocommit_now
+                            && unfinished_writer
+                            && err.is_some()
+                            && !mid_write_error
+                            && state
+                                .pages_dirtied_at_write_start
+                                .is_some_and(|at_start| pager.pages_dirtied_count() != at_start);
+                        if wrote_without_savepoint {
+                            tracing::error!(
+                                "statement dirtied pages, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                            debug_assert!(
+                                false,
+                                "statement dirtied pages, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                        }
+                        if can_autocommit_now || mid_write_error || wrote_without_savepoint {
                             self.rollback_current_txn(pager);
                         }
                     }

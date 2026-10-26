@@ -5333,6 +5333,9 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        if is_main_db {
+                            state.pages_dirtied_at_write_start = Some(pager.pages_dirtied_count());
+                        }
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;

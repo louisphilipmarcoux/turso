@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use turso_core::Value;
-use turso_pg::{Connection, DatabaseOpts, Error, ErrorReport, LimboError, OpenFlags};
+use turso_pg::{
+    Connection, DatabaseOpts, Error, ErrorReport, LimboError, OpenFlags, StepResult,
+    TransactionState,
+};
 
 fn pg_connection() -> (Arc<dyn turso_core::IO>, Connection) {
     let (io, db) =
@@ -630,6 +633,269 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
             "reporting changed transaction behavior for {sql}"
         );
     }
+}
+
+#[test]
+fn runtime_error_in_explicit_transaction_aborts_it() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let e = exec_err(&conn, "SELECT 1");
+    assert_eq!(
+        e.sqlstate, "25P02",
+        "statements after a runtime error in an explicit tx must return 25P02"
+    );
+    assert_eq!(
+        e.message,
+        "current transaction is aborted, commands ignored until end of transaction block"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn commit_of_aborted_transaction_rolls_back() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    conn.execute("COMMIT").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(
+        rows[0][0],
+        Value::from_i64(0),
+        "COMMIT after aborted tx must roll back — no rows should be committed"
+    );
+}
+
+#[test]
+fn syntax_error_aborts_transaction() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (id INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn.execute("SELCT 1").is_err());
+    let e = exec_err(&conn, "INSERT INTO t VALUES (1)");
+    assert_eq!(e.sqlstate, "25P02", "a syntax error must abort the block");
+    conn.execute("ROLLBACK").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0], Value::from_i64(0));
+}
+
+#[test]
+fn unknown_table_error_at_prepare_aborts_transaction() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn.prepare("SELECT * FROM nonexistent").is_err());
+    let e = exec_err(&conn, "SELECT 1");
+    assert_eq!(e.sqlstate, "25P02", "a prepare error must abort the block");
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn statement_prepared_before_the_error_is_rejected_after_it() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let mut stmt = conn.prepare("SELECT 1").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let e = stmt.run_collect_rows().unwrap_err();
+    assert_eq!(
+        e.sqlstate, "25P02",
+        "executing a statement prepared before the error must be rejected too"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    stmt.reset().unwrap();
+    stmt.run_collect_rows().unwrap();
+}
+
+#[test]
+fn failing_insert_aborts_the_block_and_rollback_recovers() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(
+        exec_err(&conn, "INSERT INTO t VALUES (1/0)").sqlstate,
+        "22012"
+    );
+    assert_eq!(
+        exec_err(&conn, "SELECT 1").sqlstate,
+        "25P02",
+        "a failed write must abort the block like any other error"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0], Value::from_i64(0));
+}
+
+#[test]
+fn rollback_to_savepoint_recovers_aborted_transaction() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("SAVEPOINT a").unwrap();
+    let _err = exec_err(&conn, "INSERT INTO t VALUES (1)");
+    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+    conn.execute("ROLLBACK TO SAVEPOINT a").unwrap();
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Active,
+        "ROLLBACK TO SAVEPOINT must return the block to normal"
+    );
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0], Value::from_i64(2));
+}
+
+#[test]
+fn interrupted_statement_aborts_the_block() {
+    // A query timeout interrupts the statement; the core reports that as
+    // StepResult::Interrupt rather than an error, but PostgreSQL treats
+    // cancellation as an ordinary error that aborts the block.
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+    stmt.set_query_timeout_override(Some(Some(std::time::Duration::from_nanos(1))));
+    assert!(matches!(stmt.step(), Ok(StepResult::Interrupt)));
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Aborted,
+        "query cancellation is an ordinary error in PostgreSQL and aborts the block"
+    );
+    assert_eq!(exec_err(&conn, "SELECT 1").sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn error_in_autocommit_does_not_abort_the_session() {
+    let (_io, conn) = pg_connection();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn second_error_keeps_the_transaction_aborted() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    assert_eq!(exec_err(&conn, "SELECT 1").sqlstate, "25P02");
+    assert_eq!(exec_err(&conn, "SELECT 2").sqlstate, "25P02");
+    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn commit_of_aborted_transaction_reports_the_rollback_tag() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert_eq!(commit.command_tag_override(), None);
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(
+        commit.command_tag_override(),
+        Some("ROLLBACK"),
+        "COMMIT that ended an aborted block must report ROLLBACK"
+    );
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+
+    conn.execute("BEGIN").unwrap();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(
+        commit.command_tag_override(),
+        None,
+        "a normal COMMIT keeps its own tag"
+    );
+}
+
+#[test]
+fn preparing_commit_while_aborted_has_no_side_effects() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let stmt = conn.prepare("COMMIT").unwrap();
+    drop(stmt);
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Aborted,
+        "preparing COMMIT without executing it must not end the block"
+    );
+    assert_eq!(exec_err(&conn, "SELECT 1").sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn failed_commit_returns_the_session_to_idle() {
+    // A schema change committed by another connection makes this
+    // connection's COMMIT fail with a schema conflict.
+    let (_io, db) =
+        turso_pg::open_database(":memory:", None, OpenFlags::default(), DatabaseOpts::new())
+            .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    let ddl_conn = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 0)").unwrap();
+    ddl_conn.execute("ALTER TABLE t ADD COLUMN w INT").unwrap();
+    let e = exec_err(&conn, "COMMIT");
+    assert_eq!(e.sqlstate, "40001");
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Idle,
+        "a failed COMMIT rolls back and goes idle, it does not abort the session"
+    );
+    conn.execute("SELECT 1").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap()[0][0],
+        Value::from_i64(0),
+        "the failed transaction's insert must be rolled back"
+    );
+}
+
+#[test]
+fn transaction_rolled_back_by_the_core_still_reports_aborted() {
+    // A write-write conflict makes the core roll the whole transaction back
+    // on its own. The session must still be in the aborted state afterwards:
+    // without it, later statements would silently run and commit in
+    // autocommit while the client believes it is mid-transaction.
+    let (_io, db) =
+        turso_pg::open_database(":memory:", None, OpenFlags::default(), DatabaseOpts::new())
+            .unwrap();
+    let conn1 = Connection::connect(&db).unwrap();
+    let conn2 = Connection::connect(&db).unwrap();
+    conn1
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn2.execute("BEGIN").unwrap();
+    conn1.execute("UPDATE t SET v = 1 WHERE id = 1").unwrap();
+    let _conflict = exec_err(&conn2, "UPDATE t SET v = 2 WHERE id = 1");
+    assert!(
+        conn2.inner().get_auto_commit(),
+        "the conflict must have rolled the core transaction back already"
+    );
+    assert_eq!(conn2.transaction_state(), TransactionState::Aborted);
+    assert_eq!(
+        exec_err(&conn2, "INSERT INTO t VALUES (3, 3)").sqlstate,
+        "25P02"
+    );
+    conn2.execute("ROLLBACK").unwrap();
+    assert_eq!(conn2.transaction_state(), TransactionState::Idle);
+    conn1.execute("COMMIT").unwrap();
 }
 
 fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>) {

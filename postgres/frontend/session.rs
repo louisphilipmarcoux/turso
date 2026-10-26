@@ -3,12 +3,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::catalog::{self, PostgresDialect};
-use crate::error::sqlstate_error;
+use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
 use crate::functions::ConfigParameter;
 use crate::settings::{PgSessionState, SettingScope};
+use crate::statement::TxRole;
 use turso_core::{is_memory_like, Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::sqlstate::{
@@ -19,8 +23,9 @@ use turso_pg_parser::sqlstate::{
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview,
     try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt,
-    PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    try_extract_show, tx_exit_stmt, unnamed_index_name, unqualified_create_table_name_location,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt,
+    PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -33,6 +38,17 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
+    tx_aborted: Arc<AtomicBool>,
+}
+
+/// The transaction state of a session as PostgreSQL reports it in
+/// ReadyForQuery: idle, inside a transaction block, or inside a failed
+/// transaction block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransactionState {
+    Idle,
+    Active,
+    Aborted,
 }
 
 const SEARCH_PATH_SETTING: &str = "search_path";
@@ -82,12 +98,25 @@ impl PgConnection {
         conn.add_namespace("public", turso_core::MAIN_DB_ID);
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
-            inner: Arc::new(PgConnectionInner { conn }),
+            inner: Arc::new(PgConnectionInner {
+                conn,
+                tx_aborted: Arc::new(AtomicBool::new(false)),
+            }),
         })
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    pub fn transaction_state(&self) -> TransactionState {
+        if self.inner.tx_aborted.load(Ordering::Relaxed) {
+            TransactionState::Aborted
+        } else if !self.inner.conn.get_auto_commit() {
+            TransactionState::Active
+        } else {
+            TransactionState::Idle
+        }
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
@@ -178,11 +207,32 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
             "The supplied SQL string contains no statements".to_string(),
         ));
     }
+    let result = prepare_statement_inner(pg_conn, sql);
+    // In PostgreSQL any error inside a transaction block aborts the block,
+    // including errors raised before execution: syntax errors, unknown
+    // objects, unsupported statements.
+    if result.is_err() && !pg_conn.conn.get_auto_commit() {
+        pg_conn.tx_aborted.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+fn prepare_statement_inner(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+) -> Result<crate::Statement> {
+    if pg_conn.tx_aborted.load(Ordering::Relaxed) {
+        reject_unless_ends_aborted_tx(sql)?;
+    }
 
     reject_sqlite_catalog_access(sql)?;
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
-        return Ok(stmt);
+        return Ok(stmt.with_tx_tracking(
+            Arc::clone(&pg_conn.conn),
+            Arc::clone(&pg_conn.tx_aborted),
+            TxRole::Other,
+        ));
     }
 
     let parse_result =
@@ -216,16 +266,17 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
 
+    let conn = Arc::clone(&pg_conn.conn);
+    let tx_aborted = Arc::clone(&pg_conn.tx_aborted);
+    let role = tx_role(translated.cmd.stmt());
+
     if translated.prereqs.is_empty() {
         return pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
-            .map(crate::Statement::new);
+            .map(|s| crate::Statement::new(s).with_tx_tracking(conn, tx_aborted, role));
     }
 
-    // Validate prerequisites and the target command during prepare without
-    // executing any writes. Side-effecting prerequisites run atomically with
-    // the command only when the returned Statement is actually executed.
     for prereq in &translated.prereqs {
         let input = prereq.to_string();
         let _ = pg_conn
@@ -242,7 +293,33 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         Box::new(move |inner| {
             execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
         }),
-    ))
+    )
+    .with_tx_tracking(conn, tx_aborted, role))
+}
+
+/// In an aborted transaction block PostgreSQL accepts only the statements
+/// that end it — COMMIT/END, ROLLBACK/ABORT, and ROLLBACK TO SAVEPOINT —
+/// and rejects everything else with 25P02 until the block is closed.
+fn reject_unless_ends_aborted_tx(sql: &str) -> Result<()> {
+    let parse_result =
+        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    if tx_exit_stmt(&parse_result).is_some() {
+        return Ok(());
+    }
+    Err(in_failed_sql_transaction_error())
+}
+
+fn tx_role(stmt: &ast::Stmt) -> TxRole {
+    match stmt {
+        ast::Stmt::Begin { .. } => TxRole::Begin,
+        ast::Stmt::Commit { .. } => TxRole::Commit,
+        ast::Stmt::Rollback {
+            savepoint_name: Some(_),
+            ..
+        } => TxRole::RollbackToSavepoint,
+        ast::Stmt::Rollback { .. } => TxRole::Rollback,
+        _ => TxRole::Other,
+    }
 }
 
 const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";

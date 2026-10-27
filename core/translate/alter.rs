@@ -21,7 +21,12 @@ use crate::{
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
+        collate::CollationSeq,
+        emitter::{
+            emit_cdc_autocommit_commit, emit_cdc_insns, emit_check_constraints,
+            gencol::compute_virtual_columns, prepare_cdc_if_necessary, OperationMode, Resolver,
+            UpdateRowSource,
+        },
         expr::{
             emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
             NoConstantOptReason, WalkControl,
@@ -43,7 +48,7 @@ use crate::{
         insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
-    LimboError, Numeric, Result, Value, ValueRef,
+    CaptureDataChangesExt, LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
@@ -778,6 +783,7 @@ pub fn translate_alter_table(
                 resolver,
                 connection,
                 database_id,
+                input,
             );
         }
     }
@@ -1569,6 +1575,13 @@ pub fn translate_alter_table(
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
                 db: database_id,
             });
+            let cdc_cursor_id = prepare_cdc_if_necessary(
+                program,
+                resolver.schema(),
+                database_id,
+                Some(SQLITE_TABLEID),
+            )?
+            .map(|(cdc_cursor_id, _)| cdc_cursor_id);
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns().len();
@@ -1580,7 +1593,7 @@ pub fn translate_alter_table(
                     program.emit_column_or_rowid(cursor_id, i, first_column + i);
                 }
 
-                program.emit_string8_new_reg(table_name.to_string());
+                let table_name_reg = program.emit_string8_new_reg(table_name.to_string());
                 program.mark_last_insn_constant();
 
                 program.emit_string8_new_reg(new_name.to_string());
@@ -1608,6 +1621,17 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                emit_cdc_for_altered_table_row(
+                    program,
+                    resolver,
+                    cdc_cursor_id,
+                    rowid,
+                    first_column,
+                    table_name_reg,
+                    record,
+                    input,
+                )?;
+
                 // In MVCC mode, we need to delete before insert to properly
                 // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
                 if database_uses_mvcc(connection, database_id) {
@@ -1625,7 +1649,8 @@ pub fn translate_alter_table(
                     flag: crate::vdbe::insn::InsertFlags(0),
                     table_name: table_name.to_string(),
                 });
-            });
+                Ok::<_, LimboError>(())
+            })?;
 
             emit_rename_sqlite_sequence_entry(
                 program,
@@ -1722,6 +1747,7 @@ pub fn translate_alter_table(
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
             });
+            emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
@@ -2063,6 +2089,13 @@ pub fn translate_alter_table(
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
                 db: database_id,
             });
+            let cdc_cursor_id = prepare_cdc_if_necessary(
+                program,
+                resolver.schema(),
+                database_id,
+                Some(SQLITE_TABLEID),
+            )?
+            .map(|(cdc_cursor_id, _)| cdc_cursor_id);
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns().len();
@@ -2074,7 +2107,7 @@ pub fn translate_alter_table(
                     program.emit_column_or_rowid(cursor_id, i, first_column + i);
                 }
 
-                program.emit_string8_new_reg(table_name.to_string());
+                let table_name_reg = program.emit_string8_new_reg(table_name.to_string());
                 program.mark_last_insn_constant();
 
                 program.emit_string8_new_reg(from.to_string());
@@ -2109,6 +2142,17 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                emit_cdc_for_altered_table_row(
+                    program,
+                    resolver,
+                    cdc_cursor_id,
+                    rowid,
+                    first_column,
+                    table_name_reg,
+                    record,
+                    input,
+                )?;
+
                 // In MVCC mode, we need to delete before insert to properly
                 // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
                 if database_uses_mvcc(connection, database_id) {
@@ -2126,7 +2170,8 @@ pub fn translate_alter_table(
                     flag: crate::vdbe::insn::InsertFlags(0),
                     table_name: table_name.to_string(),
                 });
-            });
+                Ok::<_, LimboError>(())
+            })?;
 
             // Update trigger SQL for renamed columns
             for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite.clone() {
@@ -2154,14 +2199,16 @@ pub fn translate_alter_table(
                     )));
                 };
 
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
-                    program,
-                    connection,
-                    input,
-                    |_program| {},
-                )?;
+                program.without_capture_data_changes(|program| {
+                    translate_update_for_schema_change(
+                        update,
+                        resolver,
+                        program,
+                        connection,
+                        input,
+                        |_program| {},
+                    )
+                })?;
             }
 
             // Update view SQL for renamed columns
@@ -2188,14 +2235,16 @@ pub fn translate_alter_table(
                     )));
                 };
 
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
-                    program,
-                    connection,
-                    input,
-                    |_program| {},
-                )?;
+                program.without_capture_data_changes(|program| {
+                    translate_update_for_schema_change(
+                        update,
+                        resolver,
+                        program,
+                        connection,
+                        input,
+                        |_program| {},
+                    )
+                })?;
             }
 
             if let Some(temp_schema_version) = temp_schema_version {
@@ -2291,9 +2340,101 @@ pub fn translate_alter_table(
                     rewritten_triggers: triggers_to_rewrite,
                 }),
             });
+            emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
         }
     };
 
+    Ok(())
+}
+
+/// Record the rewrite of the altered table's own `sqlite_schema` row the way ADD COLUMN records
+/// it: one UPDATE whose `updates` hold the ALTER statement in place of the new `sql`, so that a
+/// CDC consumer replays the statement once. The other rows rewritten by the ALTER (indexes,
+/// triggers, views) are not recorded, because replaying the statement rewrites them too.
+#[allow(clippy::too_many_arguments)]
+fn emit_cdc_for_altered_table_row(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: Option<usize>,
+    rowid_reg: usize,
+    old_row_start_reg: usize,
+    table_name_reg: usize,
+    new_row_record_reg: usize,
+    alter_statement: &str,
+) -> Result<()> {
+    let Some(cdc_cursor_id) = cdc_cursor_id else {
+        return Ok(());
+    };
+    let skip_cdc_label = program.allocate_label();
+    let table_type_reg = program.emit_string8_new_reg("table".to_string());
+    program.mark_last_insn_constant();
+    program.emit_insn(Insn::Ne {
+        lhs: old_row_start_reg,
+        rhs: table_type_reg,
+        target_pc: skip_cdc_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: old_row_start_reg + 1,
+        rhs: table_name_reg,
+        target_pc: skip_cdc_label,
+        flags: CmpInsFlags::default(),
+        collation: Some(CollationSeq::NoCase),
+    });
+
+    let before_record_reg = if program.capture_data_changes_info().has_before() {
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(old_row_start_reg),
+            count: 5,
+            dest_reg: to_u32(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        Some(record_reg)
+    } else {
+        None
+    };
+    let after_record_reg = program
+        .capture_data_changes_info()
+        .has_after()
+        .then_some(new_row_record_reg);
+    let updates_record_reg = if program.capture_data_changes_info().has_updates() {
+        let sql_column = 4;
+        let updates_start_reg = program.alloc_registers(10);
+        for column in 0..5 {
+            program.emit_bool(column == sql_column, updates_start_reg + column);
+            program.emit_null(updates_start_reg + 5 + column, None);
+        }
+        program.emit_string8(
+            alter_statement.to_string(),
+            updates_start_reg + 5 + sql_column,
+        );
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(updates_start_reg),
+            count: 10,
+            dest_reg: to_u32(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        Some(record_reg)
+    } else {
+        None
+    };
+    emit_cdc_insns(
+        program,
+        resolver,
+        OperationMode::UPDATE(UpdateRowSource::Normal),
+        cdc_cursor_id,
+        rowid_reg,
+        before_record_reg,
+        after_record_reg,
+        updates_record_reg,
+        SQLITE_TABLEID,
+    )?;
+    program.preassign_label_to_next_insn(skip_cdc_label);
     Ok(())
 }
 
@@ -2723,6 +2864,7 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_rename_virtual_table(
     program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
@@ -2731,6 +2873,7 @@ fn translate_rename_virtual_table(
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
+    input: &str,
 ) -> Result<()> {
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_operation()?;
@@ -2758,6 +2901,13 @@ fn translate_rename_virtual_table(
         root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
         db: database_id,
     });
+    let cdc_cursor_id = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?
+    .map(|(cdc_cursor_id, _)| cdc_cursor_id);
 
     program.cursor_loop(schema_cur, |program, rowid| {
         let ncols = sqlite_schema.columns().len();
@@ -2768,7 +2918,7 @@ fn translate_rename_virtual_table(
             program.emit_column_or_rowid(schema_cur, i, first_col + i);
         }
 
-        program.emit_string8_new_reg(old_name.to_string());
+        let old_name_reg = program.emit_string8_new_reg(old_name.to_string());
         program.mark_last_insn_constant();
 
         program.emit_string8_new_reg(new_name_norm.clone());
@@ -2795,6 +2945,17 @@ fn translate_rename_virtual_table(
             affinity_str: None,
         });
 
+        emit_cdc_for_altered_table_row(
+            program,
+            resolver,
+            cdc_cursor_id,
+            rowid,
+            first_col,
+            old_name_reg,
+            rec,
+            input,
+        )?;
+
         // In MVCC mode, we need to delete before insert to properly
         // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
         if database_uses_mvcc(connection, database_id) {
@@ -2812,7 +2973,8 @@ fn translate_rename_virtual_table(
             flag: crate::vdbe::insn::InsertFlags(0),
             table_name: old_name.to_string(),
         });
-    });
+        Ok::<_, LimboError>(())
+    })?;
 
     // Bump schema cookie
     program.emit_insn(Insn::SetCookie {
@@ -2827,6 +2989,7 @@ fn translate_rename_virtual_table(
         from: old_name.to_owned(),
         to: new_name_norm,
     });
+    emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
 
     program.emit_insn(Insn::Close {
         cursor_id: schema_cur,
